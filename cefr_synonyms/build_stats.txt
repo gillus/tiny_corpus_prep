@@ -1,0 +1,6 @@
+Total difficult targets: 4207
+Mapped: 1299 (30.88%)
+Unmapped: 2908
+WordNet used: True
+Easy levels: A1, A2
+Difficult levels: B2, C1, C2
