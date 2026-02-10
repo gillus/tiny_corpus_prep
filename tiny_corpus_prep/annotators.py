@@ -5,8 +5,11 @@ Provides base class and example implementations (e.g., Gemini API).
 from __future__ import annotations
 from typing import Any, Dict, Optional, Callable
 from abc import ABC, abstractmethod
+import logging
 import polars as pl
 from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 
 class BaseAnnotator(ABC):
@@ -211,22 +214,22 @@ Output ONLY the JSON object.
             
             # Validate response
             if topic not in self.ALLOWED_TOPICS:
-                print(f"Warning: Received invalid topic '{topic}'. Setting to None.")
+                logger.warning("Received invalid topic '%s'. Setting to None.", topic)
                 topic = None
             if education not in self.EDUCATION_LEVELS:
-                print(f"Warning: Received invalid education '{education}'. Setting to None.")
+                logger.warning("Received invalid education '%s'. Setting to None.", education)
                 education = None
             
             return {"topic": topic, "education": education}
         
         except json.JSONDecodeError:
-            print(f"Error: Failed to decode JSON response: {raw_response_text}")
+            logger.error("Failed to decode JSON response: %s", raw_response_text)
             return {"topic": "Error: JSON Decode", "education": "Error: JSON Decode"}
         except ValueError as ve:
-            print(f"Error: Gemini API ValueError. Details: {ve}")
+            logger.error("Gemini API ValueError: %s", ve)
             return {"topic": "Error: API Value", "education": "Error: API Value"}
         except Exception as e:
-            print(f"An unexpected error occurred: {e}")
+            logger.error("Unexpected error during annotation: %s", e)
             return {"topic": "Error: API Call", "education": "Error: API Call"}
 
 

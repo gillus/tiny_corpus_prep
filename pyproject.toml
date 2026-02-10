@@ -19,6 +19,9 @@ annotators = [
     "google-generativeai>=0.3.0",
     "python-dotenv>=1.0.0",
 ]
+dedup = [
+    "datasketch>=1.6.0",
+]
 
 [tool.setuptools]
 packages = ["tiny_corpus_prep"]
@@ -30,4 +33,5 @@ build-backend = "setuptools.build_meta"
 [dependency-groups]
 dev = [
     "ipykernel>=6.31.0",
+    "pytest>=7.0.0",
 ]

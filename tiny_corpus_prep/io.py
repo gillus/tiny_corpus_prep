@@ -3,10 +3,14 @@ IO helpers for Polars DataFrame operations with parquet.
 Includes reading, writing, and statistics generation.
 """
 from __future__ import annotations
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Iterator, Optional
 from pathlib import Path
 import json
+import logging
 import polars as pl
+import pyarrow.parquet as pq
+
+logger = logging.getLogger(__name__)
 
 
 def read_parquet(path: str, text_column: str = "text") -> pl.DataFrame:
@@ -36,6 +40,42 @@ def read_parquet(path: str, text_column: str = "text") -> pl.DataFrame:
         )
     
     return df
+
+
+def read_parquet_chunked(
+    path: str,
+    text_column: str = "text",
+    chunk_size: int = 50_000,
+) -> Iterator[pl.DataFrame]:
+    """
+    Yield Polars DataFrames from a parquet file in chunks.
+
+    Uses PyArrow's ``iter_batches`` for memory-efficient streaming.
+
+    Args:
+        path: Path to parquet file
+        text_column: Name of required text column
+        chunk_size: Rows per chunk
+
+    Yields:
+        Polars DataFrames of at most *chunk_size* rows
+    """
+    path_obj = Path(path)
+    if not path_obj.exists():
+        raise FileNotFoundError(f"Parquet file not found: {path}")
+
+    pf = pq.ParquetFile(path_obj)
+    schema_names = pf.schema_arrow.names
+    if text_column not in schema_names:
+        raise ValueError(
+            f"Required column '{text_column}' not found in parquet file. "
+            f"Available columns: {schema_names}"
+        )
+
+    for batch in pf.iter_batches(batch_size=chunk_size):
+        df = pl.from_arrow(batch)
+        if len(df) > 0:
+            yield df
 
 
 def write_parquet(df: pl.DataFrame, path: str) -> None:

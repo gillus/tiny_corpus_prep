@@ -16,11 +16,15 @@ python bin/prepare_corpus.py \
   --api-key YOUR_API_KEY
 """
 import argparse
+import logging
 from pathlib import Path
 from typing import List, Optional
 
-from tiny_corpus_prep.pipeline import process_corpus
+from tiny_corpus_prep.pipeline import process_corpus, process_corpus_chunked
 from tiny_corpus_prep.annotators import GeminiAnnotator
+from tiny_corpus_prep.common import CEFRIndex
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args():
@@ -51,26 +55,52 @@ def parse_args():
         help="Comma-separated keywords for topic filter"
     )
     ap.add_argument(
-        "--max-grade", 
-        type=float, 
-        default=8.0,
-        help="Flesch-Kincaid max grade level (default: 8.0)"
+        "--max-grade",
+        type=float,
+        default=10.0,
+        help="Flesch-Kincaid max grade level (default: 10.0)"
     )
     ap.add_argument(
         "--no-max-grade",
         action="store_true",
         help="Disable readability filtering"
     )
+    # Length filters
+    ap.add_argument("--min-chars", type=int, default=None, help="Minimum document character count")
+    ap.add_argument("--max-chars", type=int, default=None, help="Maximum document character count")
+    ap.add_argument("--min-words", type=int, default=None, help="Minimum document word count")
+    ap.add_argument("--max-words", type=int, default=None, help="Maximum document word count")
+    # Vocabulary complexity filters
+    ap.add_argument("--cefr-csv", default=None, help="Path to CEFR CSV for vocabulary complexity filter")
+    ap.add_argument("--max-rare-ratio", type=float, default=0.3, help="Max rare-word ratio (default: 0.3)")
+    ap.add_argument("--count-unknown-as-rare", action="store_true", help="Count words not in CEFR index as rare")
+    ap.add_argument(
+        "--normalize-mode",
+        choices=["gentle", "aggressive", "none"],
+        default="gentle",
+        help="Text normalization mode (default: gentle)"
+    )
     ap.add_argument(
         "--no-normalize",
         action="store_true",
-        help="Skip text normalization"
+        help="Skip text normalization (alias for --normalize-mode none)"
+    )
+    # Dedup options
+    ap.add_argument(
+        "--dedup-mode",
+        choices=["exact", "minhash", "both", "none"],
+        default="exact",
+        help="Deduplication mode (default: exact)"
     )
     ap.add_argument(
-        "--no-dedup", 
+        "--no-dedup",
         action="store_true",
-        help="Skip deduplication"
+        help="Skip deduplication (alias for --dedup-mode none)"
     )
+    ap.add_argument("--minhash-threshold", type=float, default=0.8, help="MinHash Jaccard threshold (default: 0.8)")
+    ap.add_argument("--minhash-num-perm", type=int, default=128, help="MinHash permutations (default: 128)")
+    # Chunked processing
+    ap.add_argument("--chunk-size", type=int, default=None, help="Process in chunks of N rows (enables chunked mode)")
     ap.add_argument(
         "--no-stats",
         action="store_true",
@@ -94,21 +124,39 @@ def parse_args():
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = parse_args()
-    
+
     # Parse keywords
     keywords = None
     if args.keywords:
         keywords = [k.strip() for k in args.keywords.split(",") if k.strip()]
     
+    # Determine normalize_mode
+    normalize_mode = None if args.no_normalize else args.normalize_mode
+    if normalize_mode == "none":
+        normalize_mode = None
+
     # Determine max_grade
     max_grade = None if args.no_max_grade else args.max_grade
-    
+
+    # Determine dedup_mode
+    dedup_mode = None if args.no_dedup else args.dedup_mode
+    if dedup_mode == "none":
+        dedup_mode = None
+
+    # Load CEFR index if provided
+    cefr_index = None
+    if args.cefr_csv:
+        from pathlib import Path as _P
+        cefr_index = CEFRIndex.from_csv(_P(args.cefr_csv))
+        logger.info("Loaded CEFR index from %s", args.cefr_csv)
+
     # Setup annotators
     annotators = []
     if args.annotate == "gemini":
         if not args.api_key:
-            print("Warning: --api-key not provided for Gemini. Will try to load from environment.")
+            logger.warning("--api-key not provided for Gemini. Will try to load from environment.")
         try:
             annotators.append(
                 GeminiAnnotator(
@@ -116,38 +164,52 @@ def main():
                     model_name=args.gemini_model
                 )
             )
-            print(f"Added Gemini annotator with model: {args.gemini_model}")
+            logger.info("Added Gemini annotator with model: %s", args.gemini_model)
         except Exception as e:
-            print(f"Error initializing Gemini annotator: {e}")
+            logger.error("Error initializing Gemini annotator: %s", e)
             return 1
     
     # Process corpus
     try:
-        stats = process_corpus(
+        common_kwargs = dict(
             input_path=args.input,
             output_path=args.output,
             text_column=args.text_column,
-            normalize=not args.no_normalize,
+            normalize_mode=normalize_mode,
             keywords=keywords,
             max_grade=max_grade,
+            min_chars=args.min_chars,
+            max_chars=args.max_chars,
+            min_words=args.min_words,
+            max_words=args.max_words,
+            cefr_index=cefr_index,
+            max_rare_ratio=args.max_rare_ratio,
+            count_unknown_as_rare=args.count_unknown_as_rare,
             synonyms_map_path=args.synonyms,
-            annotators=annotators if annotators else None,
-            dedup=not args.no_dedup,
-            generate_stats=not args.no_stats,
+            dedup_mode=dedup_mode,
         )
+        if args.chunk_size:
+            stats = process_corpus_chunked(
+                **common_kwargs,
+                chunk_size=args.chunk_size,
+            )
+        else:
+            stats = process_corpus(
+                **common_kwargs,
+                annotators=annotators if annotators else None,
+                generate_stats=not args.no_stats,
+            )
         
-        print("\n✓ Processing complete!")
+        logger.info("Processing complete!")
         if stats:
-            print(f"  Final rows: {stats.get('total_rows', 'N/A')}")
-            print(f"  Output: {args.output}")
-            print(f"  Stats: {Path(args.output).with_suffix('.json')}")
+            logger.info("  Final rows: %s", stats.get('total_rows', 'N/A'))
+            logger.info("  Output: %s", args.output)
+            logger.info("  Stats: %s", Path(args.output).with_suffix('.json'))
         
         return 0
     
     except Exception as e:
-        print(f"\n✗ Error: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error("Error: %s", e, exc_info=True)
         return 1
 
 

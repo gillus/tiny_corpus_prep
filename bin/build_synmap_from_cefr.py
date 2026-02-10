@@ -18,10 +18,13 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 from tiny_corpus_prep.common import (
     CEFR_ORDER,
@@ -165,7 +168,9 @@ def main():
                     help="Only build mappings for purely alphabetic headwords (skip entries like 'a.m.')")
     
     args = ap.parse_args()
-    
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
     out_dir: Path = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     
@@ -175,26 +180,26 @@ def main():
         difficult_levels.append("B1")
     
     # Load CEFR index
-    print(f"Loading CEFR index from {args.cefr_csv}")
+    logger.info("Loading CEFR index from %s", args.cefr_csv)
     cefr = CEFRIndex.from_csv(args.cefr_csv)
-    
+
     # Determine easy words
     easy_max_rank = max(CEFR_ORDER[l] for l in easy_levels)
     easy_words: Dict[str, int] = {
         w: r for w, r in cefr.headword_to_rank.items() if r <= easy_max_rank
     }
-    print(f"Found {len(easy_words)} easy words ({', '.join(easy_levels)})")
-    
+    logger.info("Found %d easy words (%s)", len(easy_words), ', '.join(easy_levels))
+
     # Load WordNet if requested
     wn = None
     if not args.no_wordnet:
-        print("Loading WordNet...")
+        logger.info("Loading WordNet...")
         wn, ok = _load_wordnet()
         if not ok:
-            print("  WordNet not available")
+            logger.info("  WordNet not available")
             wn = None
         else:
-            print("  WordNet loaded successfully")
+            logger.info("  WordNet loaded successfully")
     
     # Collect difficult target words
     diff_targets: List[str] = []
@@ -207,23 +212,23 @@ def main():
         if cefr.is_difficult(w, difficult_levels=difficult_levels):
             diff_targets.append(w)
     
-    print(f"Found {len(diff_targets)} difficult words to map ({', '.join(difficult_levels)})")
-    
+    logger.info("Found %d difficult words to map (%s)", len(diff_targets), ', '.join(difficult_levels))
+
     # Build mapping
     mapping: Dict[str, str] = {}
     provenance: Dict[str, str] = {}
-    
+
     # 1. Apply manual seed mappings
-    print("Applying manual seed mappings...")
+    logger.info("Applying manual seed mappings...")
     for src, dst in MANUAL_SEED.items():
         s, d = src.lower(), dst.lower()
         if s in cefr.headword_to_rank and d in easy_words:
             mapping[s] = d
             provenance[s] = "manual"
-    print(f"  Added {len(mapping)} manual mappings")
-    
+    logger.info("  Added %d manual mappings", len(mapping))
+
     # 2. Try WordNet or lemma fallback for remaining words
-    print("Finding synonyms from WordNet and lemmatization...")
+    logger.info("Finding synonyms from WordNet and lemmatization...")
     wordnet_count = 0
     lemma_count = 0
     
@@ -255,8 +260,8 @@ def main():
             mapping[w] = best
             provenance[w] = "wordnet" if (best and wn and w not in mapping) else "lemma_fallback"
     
-    print(f"  Added {wordnet_count} from WordNet")
-    print(f"  Added {lemma_count} from lemmatization")
+    logger.info("  Added %d from WordNet", wordnet_count)
+    logger.info("  Added %d from lemmatization", lemma_count)
     
     # Write outputs
     json_path = out_dir / "synonyms.json"
@@ -264,7 +269,7 @@ def main():
     unmapped_path = out_dir / "unmapped.txt"
     stats_path = out_dir / "build_stats.txt"
     
-    print(f"\nWriting outputs to {out_dir}")
+    logger.info("Writing outputs to %s", out_dir)
     
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(mapping, f, ensure_ascii=False, indent=2)
@@ -297,11 +302,11 @@ def main():
         f.write(f"Easy levels: {', '.join(easy_levels)}\n")
         f.write(f"Difficult levels: {', '.join(difficult_levels)}\n")
     
-    print(f"  JSON mapping: {json_path}")
-    print(f"  CSV mapping : {csv_path}")
-    print(f"  Unmapped    : {unmapped_path}")
-    print(f"  Stats       : {stats_path}")
-    print(f"\nSummary: {mapped}/{total_diff} ({(mapped/total_diff*100 if total_diff else 0):.1f}%) words mapped")
+    logger.info("  JSON mapping: %s", json_path)
+    logger.info("  CSV mapping : %s", csv_path)
+    logger.info("  Unmapped    : %s", unmapped_path)
+    logger.info("  Stats       : %s", stats_path)
+    logger.info("Summary: %d/%d (%.1f%%) words mapped", mapped, total_diff, (mapped/total_diff*100 if total_diff else 0))
 
 
 if __name__ == "__main__":

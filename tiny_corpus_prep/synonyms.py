@@ -8,7 +8,6 @@ from __future__ import annotations
 from typing import Dict, Iterable, Tuple
 import json
 import re
-import os
 
 try:
     from .common import preserve_case_like
