@@ -10,6 +10,7 @@ dependencies = [
     "textstat>=0.7.0",
     "pyarrow>=14.0.0",
     "tqdm>=4.65.0",
+    "pyyaml>=6.0",
     "requests>=2.31.0",
     "wikiextractor>=3.0.0",
 ]
@@ -21,6 +22,20 @@ annotators = [
 ]
 dedup = [
     "datasketch>=1.6.0",
+]
+tokenizer = [
+    "tokenizers>=0.15.0",
+    "datasets>=2.14.0",
+    "numpy>=1.24.0",
+]
+quality = [
+    "langdetect>=1.0.9",
+]
+train = [
+    "torch>=2.1.0",
+    "transformers>=4.41.0",
+    "accelerate>=0.26.0",
+    "datasets>=2.14.0",
 ]
 
 [tool.setuptools]
@@ -35,3 +50,8 @@ dev = [
     "ipykernel>=6.31.0",
     "pytest>=7.0.0",
 ]
+
+[tool.pytest.ini_options]
+# The globally-installed pytest-lazyfixture plugin is unmaintained and breaks
+# parametrized tests under pytest 8; this project doesn't use it.
+addopts = "-p no:lazy-fixture"

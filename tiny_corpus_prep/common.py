@@ -119,18 +119,18 @@ class CEFRIndex:
         ranks: Dict[str, int] = {}
         with open(csv_path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
-            cols = [c.strip().lower() for c in reader.fieldnames or []]
+            # Resolve column names case-insensitively, then read rows via the
+            # actual header spelling (DictReader keys are exact-case).
+            lower_to_actual = {c.strip().lower(): c for c in reader.fieldnames or []}
             try:
-                cols.index("headword")
-                cols.index("cefr")
-            except ValueError:
+                head_col = lower_to_actual["headword"]
+                cefr_col = lower_to_actual["cefr"]
+            except KeyError:
                 raise ValueError(f"CSV must have 'headword' and 'CEFR' columns; found {reader.fieldnames}")
-            
-            f.seek(0)
-            reader = csv.DictReader(f)
+
             for row in reader:
-                head = (row.get("headword") or "").strip()
-                cefr = (row.get("CEFR") or row.get("cefr") or "").strip().upper()
+                head = (row.get(head_col) or "").strip()
+                cefr = (row.get(cefr_col) or "").strip().upper()
                 if not head or cefr not in CEFR_ORDER:
                     continue
                 head_l = head.lower()

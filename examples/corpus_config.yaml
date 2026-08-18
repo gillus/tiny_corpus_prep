@@ -1,0 +1,80 @@
+# Example corpus config for config-driven building (bin/build_corpus.py).
+#
+# Key idea: each source is processed with a *profile*, so prose can be
+# readability/vocabulary-filtered while structured text (JSON/XML schedules,
+# dialogue) passes through untouched — it must not be normalized, readability-
+# filtered, or synonym-rewritten.
+
+seed: 42
+
+output:
+  dir: data/corpus_v1
+  shard_max_docs: 100000        # docs per output shard
+
+processing:
+  text_column: text
+  chunk_size: null              # rows per chunk; null = whole file at once
+  n_workers: 1                  # worker processes for per-doc filters (readability,
+                                # CEFR, normalize); set to ~physical cores at scale
+
+profiles:
+  prose:
+    normalize_mode: gentle      # NFC, smart quotes → ASCII; keeps case/structure
+    max_grade: 10.0             # Flesch-Kincaid ceiling
+    min_words: 20
+    max_words: 20000
+    cefr_csv: null              # set to your CEFR wordlist to enable vocab filter
+    max_rare_ratio: 0.3
+    rare_levels: [B2, C1, C2]
+    count_unknown_as_rare: false
+    dedup_mode: exact           # exact | minhash | both | none
+    # minhash_threshold: 0.8    # Jaccard threshold when dedup_mode uses minhash
+    # minhash_num_perm: 128
+    paragraph_dedup: true       # drop paragraphs repeated across documents
+    paragraph_min_chars: 50     # short repeated lines (headings) are kept
+    strip_boilerplate: true     # remove cookie/share/copyright lines
+    # boilerplate_patterns: ["my-site-footer"]   # extra regexes, added to defaults
+    repetition_filter: true     # drop degenerate docs (Gopher-style signals)
+    # repetition_overrides: {max_duplicate_line_ratio: 0.5}
+    language: en                # keep English only (requires [quality] extra);
+    language_min_prob: 0.8      # remove these two lines to skip the gate
+
+  structured:                   # JSON/XML/key-value/dialogue — pass through
+    normalize_mode: none
+    max_grade: null             # readability is meaningless on structured text
+    dedup_mode: exact
+
+sources:
+  # Listed order = dedup priority (earlier source keeps shared docs).
+  wiki:
+    input: data/raw/wikipedia.parquet
+    profile: prose
+    weight: 0.40
+  fineweb:
+    input: data/raw/000_00000.parquet
+    profile: prose
+    weight: 0.35
+  schedules:
+    input: data/raw/schedules.parquet
+    profile: structured
+    weight: 0.25
+    allow_upsample: true        # small synthetic source: repeat to hit its share
+
+mix:
+  # null = largest total achievable without upsampling non-upsample sources.
+  target_total_words: null
+  cross_source_dedup: true
+
+# Step 3 (bin/tokenize_corpus.py): byte-level BPE trained on the mixed shards.
+tokenizer:
+  vocab_size: 28000             # target range 24-32k for a ~600M model
+  min_frequency: 2
+  eos_token: "<|endoftext|>"
+  pad_token: "<|pad|>"
+  extra_special_tokens: []      # e.g. ["<schedule>", "</schedule>"] for XML tags
+  # Verified after training; guaranteed anyway by the byte-level alphabet.
+  require_single_tokens: ["{", "}", "[", "]", ":", '"', ",", "-", "(", ")"]
+
+dataset:
+  seq_length: 1024              # tokens per packed training sequence
+  val_fraction: 0.005           # doc-level split, deterministic given the seed

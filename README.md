@@ -11,7 +11,7 @@ Minimal, fast corpus preparation for training a tiny GPT-like model using **Pola
 - **Readability filtering**: Uses `textstat` for Flesch-Kincaid grade level filtering
 - **Keyword filtering**: Filter by topic keywords
 - **Vocabulary simplification**: Map synonyms to canonical forms
-- **CEFR-based synonym mapping**: Intelligent word simplification using CEFR language levels (see [CEFR_SYNONYMS.md](CEFR_SYNONYMS.md))
+- **CEFR-based synonym mapping**: Intelligent word simplification using CEFR language levels (see [examples/cefr_synonym_example.py](examples/cefr_synonym_example.py))
 - **Custom annotations**: Extend with your own annotation logic
 - **Gemini integration**: Built-in support for Google Gemini API annotations
 - **Statistics generation**: Automatic JSON stats for output datasets
@@ -38,7 +38,7 @@ This will:
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Install with all features (recommended)
-uv pip install -e ".[annotators,downloaders]"
+uv pip install -e ".[annotators,dedup]"
 
 # Or install with annotation support only
 uv pip install -e ".[annotators]"
@@ -51,7 +51,7 @@ uv pip install -e .
 
 ```bash
 # With all features
-pip install -e ".[annotators,downloaders]"
+pip install -e ".[annotators,dedup]"
 
 # Or with annotations only
 pip install -e ".[annotators]"
@@ -76,6 +76,90 @@ python -u bin/download_data.py --source fineweb --output-dir data/raw --num-file
 **Tip:** Use `python -u` for unbuffered output to see progress bars in real-time.
 
 See [QUICKSTART.md](QUICKSTART.md) for detailed instructions.
+
+### Config-driven corpus building (recommended)
+
+Describe sources, per-source processing profiles, and mix weights in one YAML
+file, then build the full corpus in a single reproducible run:
+
+```bash
+python bin/build_corpus.py --config examples/corpus_config.yaml
+```
+
+Each source is processed with its own *profile* (so prose can be
+readability/vocabulary-filtered while structured text like JSON/XML passes
+through untouched), then all sources are mixed at the configured word-share
+weights with a seeded RNG. Small sources can be upsampled to hit their share.
+
+Profiles also expose quality heuristics: boilerplate line stripping
+(`strip_boilerplate`), a Gopher-style degenerate-repetition filter
+(`repetition_filter`), paragraph-level dedup across documents
+(`paragraph_dedup`), MinHash near-dedup (`dedup_mode: both`), and an optional
+language gate (`language: en`, requires `pip install 'tiny_corpus_prep[quality]'`).
+Set `processing.n_workers` to parallelize the per-document filters across CPU
+cores. The output directory contains:
+
+- `processed/<source>.parquet` — per-source filtered data (+ stats JSON)
+- `shards/shard_00000.parquet` … — the final shuffled corpus (`text`, `source`)
+- `manifest.json` — resolved config, library versions, and per-stage stats,
+  so every corpus is traceable to the exact settings that produced it
+
+The same config + seed reproduces the corpus byte-for-byte. See
+[examples/corpus_config.yaml](examples/corpus_config.yaml) for a commented example.
+
+### Tokenizer training & packing
+
+After building the mixed corpus, train a custom byte-level BPE tokenizer on it
+and pack everything into a training-ready HuggingFace dataset:
+
+```bash
+# Requires: pip install 'tiny_corpus_prep[tokenizer]'
+python bin/tokenize_corpus.py --config examples/corpus_config.yaml
+```
+
+This adds to the output directory:
+
+- `tokenizer/tokenizer.json` — byte-level BPE (configurable vocab size,
+  EOS/PAD + custom special tokens, structural characters like `{ } [ ] : "`
+  verified to be single tokens), saved alongside the data for reproducibility
+- `dataset/` — a `DatasetDict` with `train`/`validation` splits of fixed-length
+  `input_ids` sequences (documents EOS-joined then chunked; the split is at
+  document level, so no document straddles train/val)
+- `tokenization_manifest.json` — token-level stats: total tokens, per-source
+  token distribution, vocab coverage, chars/token
+
+Load it for training:
+
+```python
+from datasets import load_from_disk
+from tokenizers import Tokenizer
+
+ds = load_from_disk("data/corpus_v1/dataset")        # ds["train"]["input_ids"]
+tok = Tokenizer.from_file("data/corpus_v1/tokenizer/tokenizer.json")
+```
+
+An existing tokenizer is reused on re-runs (pass `--retrain` to force
+retraining, e.g. after changing the corpus mix).
+
+### Pilot training
+
+Two helper scripts close the loop from corpus to model:
+
+```bash
+# Generate the structured/schedule source (persona-conditioned 7-day
+# household schedules in XML/JSON/key-value; deterministic per seed)
+python bin/generate_structured.py --output data/raw/schedules.parquet --num-docs 30000
+
+# Pretrain a ~50M Llama-architecture model from scratch on the built corpus
+# (requires: pip install 'tiny_corpus_prep[train]')
+python bin/train_pilot.py --corpus-dir data/corpus_v1 --output-dir runs/pilot50m
+```
+
+`train_pilot.py` reads `dataset/` + `tokenizer/` from the corpus dir,
+auto-selects precision (bf16 on Ampere+, fp16 on Turing cards like T4/RTX 20xx),
+supports `--resume`, and prints sample generations at the end. Model size is
+fully configurable (`--hidden-size`, `--num-layers`, ...) for the
+50M → 150M → 600M ladder.
 
 ### CLI Usage
 
@@ -302,7 +386,7 @@ This generates:
 - `unmapped.txt` - Words that couldn't be simplified
 - `build_stats.txt` - Statistics about the mapping process
 
-See [CEFR_SYNONYMS.md](CEFR_SYNONYMS.md) for complete documentation and examples.
+See [examples/cefr_synonym_example.py](examples/cefr_synonym_example.py) and [bin/build_synmap_from_cefr.py](bin/build_synmap_from_cefr.py) for complete usage examples.
 
 ## Downloading Data (Step 0)
 
@@ -314,7 +398,7 @@ Download and process Simple English Wikipedia:
 
 ```bash
 # Install optional dependency
-uv pip install -e ".[downloaders]"
+uv pip install -e .
 
 # Download and convert to parquet
 python bin/download_data.py --source wikipedia --output-dir data/raw
@@ -327,7 +411,7 @@ This will create a parquet file with columns: `filename`, `title`, `text`, `numb
 
 Downloads show a progress bar using Python's `requests` library.
 
-**Requirements**: `bzip2` (system dependency) and `wikiextractor` (installed with `[downloaders]` extra)
+**Requirements**: `bzip2` (system dependency) and `wikiextractor` (installed with the core package)
 
 ### FineWeb-edu (HuggingFace)
 

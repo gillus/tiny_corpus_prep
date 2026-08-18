@@ -51,34 +51,35 @@ def is_middle_school_level(text: str) -> bool:
         return False
 
 
+def _map_texts(df: pl.DataFrame, text_column: str, fn, mapper) -> list:
+    """Apply fn per text, via the optional parallel mapper (order-preserving)."""
+    texts = df[text_column].to_list()
+    if mapper is not None:
+        return mapper.map(fn, texts)
+    return [fn(t) for t in texts]
+
+
 def filter_by_readability(
-    df: pl.DataFrame, 
+    df: pl.DataFrame,
     max_grade: float = 10.0,
-    text_column: str = "text"
+    text_column: str = "text",
+    mapper=None,
 ) -> pl.DataFrame:
     """
     Filter DataFrame by readability level.
-    
+
     Args:
         df: Input Polars DataFrame
         max_grade: Maximum Flesch-Kincaid grade level to keep
         text_column: Name of the text column
-        
+        mapper: Optional parallel.TextMapper for multiprocess scoring
+
     Returns:
         Filtered DataFrame
     """
-    # Add readability grade column
-    df = df.with_columns([
-        pl.col(text_column)
-        .map_elements(calculate_readability_grade, return_dtype=pl.Float64)
-        .alias("_readability_grade")
-    ])
-    
-    # Filter and remove temporary column
-    return df.filter(
-        (pl.col("_readability_grade").is_not_null()) & 
-        (pl.col("_readability_grade") <= max_grade)
-    ).drop("_readability_grade")
+    grades = _map_texts(df, text_column, calculate_readability_grade, mapper)
+    keep = [g is not None and g <= max_grade for g in grades]
+    return df.filter(pl.Series(keep))
 
 
 def filter_by_keywords(
@@ -141,8 +142,8 @@ def filter_by_length(
     if max_chars is not None:
         conditions.append(pl.col(text_column).str.len_chars() <= max_chars)
     if min_words is not None or max_words is not None:
-        # Split on whitespace for word count
-        word_count = pl.col(text_column).str.split(" ").list.len()
+        # Count whitespace-separated runs (handles newlines/tabs/multiple spaces)
+        word_count = pl.col(text_column).str.count_matches(r"\S+")
         if min_words is not None:
             conditions.append(word_count >= min_words)
         if max_words is not None:
@@ -191,6 +192,7 @@ def filter_by_vocabulary_complexity(
     rare_levels: Sequence[str] = ("B2", "C1", "C2"),
     count_unknown_as_rare: bool = False,
     text_column: str = "text",
+    mapper=None,
 ) -> pl.DataFrame:
     """
     Filter DataFrame by vocabulary complexity using CEFR word levels.
@@ -204,18 +206,20 @@ def filter_by_vocabulary_complexity(
         rare_levels: CEFR levels considered "rare" (default B2, C1, C2)
         count_unknown_as_rare: Whether words not in CEFR index count as rare
         text_column: Name of the text column
+        mapper: Optional parallel.TextMapper for multiprocess scoring
 
     Returns:
         Filtered DataFrame
     """
-    rare_min_rank = min(CEFR_ORDER[lv] for lv in rare_levels)
+    import functools
 
-    df = df.with_columns(
-        pl.col(text_column)
-        .map_elements(
-            lambda s: _compute_rare_ratio(s, cefr_index, rare_min_rank, count_unknown_as_rare),
-            return_dtype=pl.Float64,
-        )
-        .alias("_rare_ratio")
+    rare_min_rank = min(CEFR_ORDER[lv] for lv in rare_levels)
+    ratio_fn = functools.partial(
+        _compute_rare_ratio,
+        cefr_index=cefr_index,
+        rare_min_rank=rare_min_rank,
+        count_unknown_as_rare=count_unknown_as_rare,
     )
-    return df.filter(pl.col("_rare_ratio") <= max_rare_ratio).drop("_rare_ratio")
+    ratios = _map_texts(df, text_column, ratio_fn, mapper)
+    keep = [r <= max_rare_ratio for r in ratios]
+    return df.filter(pl.Series(keep))

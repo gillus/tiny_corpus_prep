@@ -357,7 +357,7 @@ print(df.select(["text"]).head(3))
   - macOS: `brew install bzip2`
 
 **"WikiExtractor not found"**
-- Install the downloaders extra: `uv pip install -e ".[downloaders]"`
+- Reinstall the package: `uv pip install -e .` (wikiextractor is a core dependency)
 - Or install directly: `pip install wikiextractor`
 
 **Download script is slow**

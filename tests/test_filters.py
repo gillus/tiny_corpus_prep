@@ -101,6 +101,13 @@ class TestFilterByLength:
         result = filter_by_length(df, min_chars=5, max_chars=50)
         assert len(result) == 1
 
+    def test_word_count_handles_newlines_and_extra_spaces(self):
+        # Regression: split(" ") counted "one\ntwo\nthree" as 1 word and
+        # "a  b" (double space) as 3 words.
+        df = pl.DataFrame({"text": ["one\ntwo\nthree", "a  b"]})
+        assert len(filter_by_length(df, min_words=3)) == 1
+        assert len(filter_by_length(df, max_words=2)) == 1
+
 
 # ── vocabulary complexity ────────────────────────────────────────
 

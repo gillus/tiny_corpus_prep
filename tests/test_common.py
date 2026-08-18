@@ -124,3 +124,31 @@ class TestCEFRIndex:
         assert idx.rank("xyzzyx") is None
         assert idx.is_easy("xyzzyx") is False
         assert idx.is_difficult("xyzzyx") is False
+
+    @pytest.mark.parametrize("header", [
+        ("headword", "CEFR"),
+        ("Headword", "CEFR"),
+        ("HEADWORD", "cefr"),
+        ("headword", "Cefr"),
+    ])
+    def test_from_csv_header_case_insensitive(self, tmp_path: Path, header):
+        # Regression: mismatched header case used to silently produce an
+        # empty index (every row skipped), making the vocab filter a no-op.
+        csv_path = tmp_path / "cefr_case.csv"
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(list(header))
+            writer.writerow(["the", "A1"])
+            writer.writerow(["quantum", "C2"])
+        idx = CEFRIndex.from_csv(csv_path)
+        assert idx.rank("the") == CEFR_ORDER["A1"]
+        assert idx.rank("quantum") == CEFR_ORDER["C2"]
+
+    def test_from_csv_missing_columns_raises(self, tmp_path: Path):
+        csv_path = tmp_path / "bad.csv"
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["word", "level"])
+            writer.writerow(["the", "A1"])
+        with pytest.raises(ValueError):
+            CEFRIndex.from_csv(csv_path)

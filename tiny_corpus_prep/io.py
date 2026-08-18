@@ -140,9 +140,13 @@ def generate_stats(df: pl.DataFrame, text_column: str = "text") -> Dict[str, Any
         
         # Add value counts for categorical/string columns
         if df[col].dtype in [pl.Utf8, pl.Categorical]:
-            value_counts = df[col].value_counts().sort("counts", descending=True)
-            col_info["unique_values"] = len(value_counts)
-            col_info["top_values"] = value_counts.head(10).to_dicts()
+            n_unique = df[col].n_unique()
+            col_info["unique_values"] = n_unique
+            # Skip top-values for high-cardinality columns (e.g. titles, filenames)
+            if n_unique <= 1000:
+                col_info["top_values"] = (
+                    df[col].value_counts(sort=True).head(10).to_dicts()
+                )
         
         # Add numeric statistics for numeric columns
         elif df[col].dtype in [pl.Int64, pl.Int32, pl.Float64, pl.Float32]:
@@ -155,6 +159,36 @@ def generate_stats(df: pl.DataFrame, text_column: str = "text") -> Dict[str, Any
     
     stats["column_stats"] = column_stats
     
+    return stats
+
+
+def generate_stats_streaming(path: str, text_column: str = "text") -> Dict[str, Any]:
+    """
+    Generate text statistics for a parquet file without loading the text
+    into memory: streams batches and keeps only per-doc lengths (8 bytes/doc).
+
+    Unlike generate_stats, per-column stats for non-text columns are omitted.
+    """
+    pf = pq.ParquetFile(path)
+    lengths: list = []
+    null_count = 0
+    for batch in pf.iter_batches(batch_size=50_000, columns=[text_column]):
+        series = pl.from_arrow(batch)[text_column]
+        null_count += series.null_count()
+        lengths.extend(series.str.len_chars().drop_nulls().to_list())
+
+    lengths_series = pl.Series(lengths, dtype=pl.Int64)
+    stats: Dict[str, Any] = {
+        "total_rows": len(lengths) + null_count,
+        "text_stats": {
+            "min_length": lengths_series.min(),
+            "max_length": lengths_series.max(),
+            "mean_length": lengths_series.mean(),
+            "median_length": lengths_series.median(),
+            "total_characters": lengths_series.sum(),
+            "empty_or_null_count": null_count,
+        },
+    }
     return stats
 
 

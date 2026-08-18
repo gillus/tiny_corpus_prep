@@ -99,7 +99,16 @@ def parse_args():
     )
     ap.add_argument("--minhash-threshold", type=float, default=0.8, help="MinHash Jaccard threshold (default: 0.8)")
     ap.add_argument("--minhash-num-perm", type=int, default=128, help="MinHash permutations (default: 128)")
-    # Chunked processing
+    # Paragraph dedup
+    ap.add_argument("--paragraph-dedup", action="store_true", help="Remove paragraphs repeated across documents")
+    ap.add_argument("--paragraph-min-chars", type=int, default=50, help="Min paragraph length eligible for dedup (default: 50)")
+    # Quality heuristics
+    ap.add_argument("--strip-boilerplate", action="store_true", help="Remove boilerplate lines (cookie banners, share buttons, ...)")
+    ap.add_argument("--repetition-filter", action="store_true", help="Drop docs with degenerate repetition (Gopher-style signals)")
+    ap.add_argument("--language", default=None, help="Keep only docs in this language, e.g. 'en' (requires langdetect)")
+    ap.add_argument("--language-min-prob", type=float, default=0.8, help="Min language detection probability (default: 0.8)")
+    # Parallelism / chunked processing
+    ap.add_argument("--n-workers", type=int, default=1, help="Worker processes for per-doc operations (default: 1)")
     ap.add_argument("--chunk-size", type=int, default=None, help="Process in chunks of N rows (enables chunked mode)")
     ap.add_argument(
         "--no-stats",
@@ -187,6 +196,15 @@ def main():
             count_unknown_as_rare=args.count_unknown_as_rare,
             synonyms_map_path=args.synonyms,
             dedup_mode=dedup_mode,
+            n_workers=args.n_workers,
+            paragraph_dedup=args.paragraph_dedup,
+            paragraph_min_chars=args.paragraph_min_chars,
+            minhash_threshold=args.minhash_threshold,
+            minhash_num_perm=args.minhash_num_perm,
+            strip_boilerplate=args.strip_boilerplate,
+            repetition_filter=args.repetition_filter,
+            language=args.language,
+            language_min_prob=args.language_min_prob,
         )
         if args.chunk_size:
             stats = process_corpus_chunked(

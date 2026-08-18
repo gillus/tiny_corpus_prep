@@ -10,6 +10,8 @@ import polars as pl
 
 logger = logging.getLogger(__name__)
 
+import functools
+
 from .normalize import normalize_text
 from .synonyms import SynonymMapper
 from .filters import (
@@ -20,7 +22,11 @@ from .filters import (
 )
 from .common import CEFRIndex
 from .annotators import BaseAnnotator
-from .dedup import exact_dedup, minhash_dedup
+from .dedup import MinHashDeduper, exact_dedup
+from .dedup import paragraph_dedup as _paragraph_dedup_fn
+from .parallel import TextMapper
+from .quality import filter_by_language, filter_by_repetition
+from .quality import strip_boilerplate as _strip_boilerplate_fn
 from . import io as io_mod
 
 
@@ -44,9 +50,21 @@ class DataPipeline:
         dedup: Union[bool, str, None] = True,
         normalize_mode: Optional[str] = None,
         dedup_mode: Optional[str] = None,
+        n_workers: int = 1,
+        paragraph_dedup: bool = False,
+        paragraph_min_chars: int = 50,
+        minhash_threshold: float = 0.8,
+        minhash_num_perm: int = 128,
+        strip_boilerplate: bool = False,
+        boilerplate_patterns: Optional[List[str]] = None,
     ):
         """
         Initialize the pipeline.
+
+        A pipeline instance accumulates dedup state (paragraph hashes, MinHash
+        LSH index) across process() calls — intentional, so chunked processing
+        deduplicates across chunk boundaries. Use a fresh instance per corpus
+        and call close() when done (releases the worker pool).
 
         Args:
             text_column: Name of the text column
@@ -55,8 +73,26 @@ class DataPipeline:
             dedup: Backwards-compat. True → "exact", False → None.
             normalize_mode: "gentle", "aggressive", or None for no normalization.
             dedup_mode: "exact", "minhash", "both", or None. Overrides dedup.
+            n_workers: Worker processes for per-doc operations (1 = serial).
+            paragraph_dedup: Remove paragraphs already seen in earlier docs.
+            paragraph_min_chars: Min paragraph length eligible for removal.
+            minhash_threshold: Jaccard threshold for MinHash near-dedup.
+            minhash_num_perm: MinHash permutations.
+            strip_boilerplate: Remove boilerplate lines (cookie banners,
+                copyright footers, share buttons) before other processing.
+            boilerplate_patterns: Extra regex patterns added to the defaults.
         """
         self.text_column = text_column
+        self.n_workers = n_workers
+        self.paragraph_dedup = paragraph_dedup
+        self.paragraph_min_chars = paragraph_min_chars
+        self.strip_boilerplate = strip_boilerplate
+        self.boilerplate_patterns = boilerplate_patterns
+        self.minhash_threshold = minhash_threshold
+        self.minhash_num_perm = minhash_num_perm
+        self._mapper: Optional[TextMapper] = None
+        self._minhash_deduper: Optional[MinHashDeduper] = None
+        self._paragraph_seen: set = set()
         # Resolve normalize_mode: explicit param wins, then coerce bool
         if normalize_mode is not None:
             self.normalize_mode = normalize_mode
@@ -161,6 +197,24 @@ class DataPipeline:
             self.synonym_mapper = SynonymMapper.from_json(mapping_path)
         return self
     
+    def add_repetition_filter(
+        self, thresholds: Optional[Dict[str, float]] = None
+    ) -> "DataPipeline":
+        """Add degenerate-repetition filter (Gopher-style signals).
+
+        Args:
+            thresholds: Overrides for quality.DEFAULT_REPETITION_THRESHOLDS.
+        """
+        self.filters.append(("repetition", thresholds))
+        return self
+
+    def add_language_filter(
+        self, language: str, min_prob: float = 0.8
+    ) -> "DataPipeline":
+        """Keep only docs detected as *language* (requires langdetect)."""
+        self.filters.append(("language", {"language": language, "min_prob": min_prob}))
+        return self
+
     def add_annotator(self, annotator: BaseAnnotator) -> "DataPipeline":
         """
         Add custom annotator to pipeline.
@@ -174,13 +228,25 @@ class DataPipeline:
         self.annotators.append(annotator)
         return self
     
+    def mapper(self) -> TextMapper:
+        """Lazily-created (and reused) text mapper for per-doc operations."""
+        if self._mapper is None:
+            self._mapper = TextMapper(n_workers=self.n_workers)
+        return self._mapper
+
+    def close(self) -> None:
+        """Release the worker pool (if any)."""
+        if self._mapper is not None:
+            self._mapper.close()
+            self._mapper = None
+
     def process(self, df: pl.DataFrame) -> pl.DataFrame:
         """
         Process a DataFrame through the pipeline.
-        
+
         Args:
             df: Input Polars DataFrame with text column
-            
+
         Returns:
             Processed DataFrame
         """
@@ -190,35 +256,57 @@ class DataPipeline:
                 f"Text column '{self.text_column}' not found in DataFrame. "
                 f"Available columns: {df.columns}"
             )
-        
+
+        mapper = self.mapper()
         logger.info("Starting pipeline with %d rows...", len(df))
-        
+
         # Step 1: Normalize text if enabled
         if self.normalize_mode:
             logger.info("Normalizing text (mode=%s)...", self.normalize_mode)
-            mode = self.normalize_mode
-            df = df.with_columns([
-                pl.col(self.text_column)
-                .map_elements(lambda s: normalize_text(s, mode=mode), return_dtype=pl.Utf8)
-                .alias(self.text_column)
-            ])
+            normalized = mapper.map(
+                functools.partial(normalize_text, mode=self.normalize_mode),
+                df[self.text_column].to_list(),
+            )
+            df = df.with_columns(pl.Series(self.text_column, normalized, dtype=pl.Utf8))
             # Remove empty rows after normalization
             df = df.filter(
-                pl.col(self.text_column).is_not_null() & 
+                pl.col(self.text_column).is_not_null() &
                 (pl.col(self.text_column).str.strip_chars() != "")
             )
             logger.info("After normalization: %d rows", len(df))
-        
-        # Step 2: Apply filters
+
+        # Step 1b: Strip boilerplate lines (before paragraph dedup and
+        # filters — boilerplate would distort their scores).
+        if self.strip_boilerplate:
+            df = _strip_boilerplate_fn(
+                df,
+                extra_patterns=self.boilerplate_patterns,
+                text_column=self.text_column,
+                mapper=mapper,
+            )
+            logger.info("After boilerplate stripping: %d rows", len(df))
+
+        # Step 2: Paragraph-level dedup (before filters: boilerplate would
+        # distort readability/vocabulary scores). State persists across calls.
+        if self.paragraph_dedup:
+            df = _paragraph_dedup_fn(
+                df,
+                self.text_column,
+                seen_hashes=self._paragraph_seen,
+                min_chars=self.paragraph_min_chars,
+            )
+            logger.info("After paragraph dedup: %d rows", len(df))
+
+        # Step 3: Apply filters
         for filter_type, filter_arg in self.filters:
             if filter_type == "keywords":
                 logger.info("Applying keyword filter (%d keywords)...", len(filter_arg))
                 df = filter_by_keywords(df, filter_arg, self.text_column)
                 logger.info("After keyword filter: %d rows", len(df))
-            
+
             elif filter_type == "readability":
                 logger.info("Applying readability filter (max grade: %s)...", filter_arg)
-                df = filter_by_readability(df, filter_arg, self.text_column)
+                df = filter_by_readability(df, filter_arg, self.text_column, mapper=mapper)
                 logger.info("After readability filter: %d rows", len(df))
 
             elif filter_type == "length":
@@ -228,19 +316,40 @@ class DataPipeline:
 
             elif filter_type == "vocabulary":
                 logger.info("Applying vocabulary complexity filter (max_rare_ratio=%s)...", filter_arg["max_rare_ratio"])
-                df = filter_by_vocabulary_complexity(df, text_column=self.text_column, **filter_arg)
+                df = filter_by_vocabulary_complexity(
+                    df, text_column=self.text_column, mapper=mapper, **filter_arg
+                )
                 logger.info("After vocabulary filter: %d rows", len(df))
 
-        # Step 3: Apply synonym mapping
+            elif filter_type == "repetition":
+                logger.info("Applying repetition filter...")
+                df = filter_by_repetition(
+                    df, thresholds=filter_arg,
+                    text_column=self.text_column, mapper=mapper,
+                )
+                logger.info("After repetition filter: %d rows", len(df))
+
+            elif filter_type == "language":
+                logger.info("Applying language filter (%s)...", filter_arg["language"])
+                df = filter_by_language(
+                    df,
+                    language=filter_arg["language"],
+                    min_prob=filter_arg["min_prob"],
+                    text_column=self.text_column,
+                    mapper=mapper,
+                )
+                logger.info("After language filter: %d rows", len(df))
+
+        # Step 4: Apply synonym mapping
         if self.synonym_mapper:
             logger.info("Applying synonym mapping...")
-            df = df.with_columns([
-                pl.col(self.text_column)
-                .map_elements(self.synonym_mapper.simplify_line, return_dtype=pl.Utf8)
-                .alias(self.text_column)
-            ])
-        
-        # Step 4: Deduplicate
+            simplified = mapper.map(
+                self.synonym_mapper.simplify_line, df[self.text_column].to_list()
+            )
+            df = df.with_columns(pl.Series(self.text_column, simplified, dtype=pl.Utf8))
+
+        # Step 5: Deduplicate (MinHash state persists across calls for
+        # cross-chunk near-dedup)
         if self.dedup_mode:
             original_len = len(df)
             if self.dedup_mode in ("exact", "both"):
@@ -248,15 +357,22 @@ class DataPipeline:
                 df = exact_dedup(df, self.text_column)
             if self.dedup_mode in ("minhash", "both"):
                 logger.info("Running MinHash dedup...")
-                df = minhash_dedup(df, self.text_column)
+                if self._minhash_deduper is None:
+                    self._minhash_deduper = MinHashDeduper(
+                        threshold=self.minhash_threshold,
+                        num_perm=self.minhash_num_perm,
+                    )
+                df = self._minhash_deduper.filter_chunk(
+                    df, self.text_column, mapper=mapper
+                )
             removed = original_len - len(df)
             logger.info("Dedup (%s): removed %d rows, %d remaining", self.dedup_mode, removed, len(df))
-        
-        # Step 5: Apply annotators
+
+        # Step 6: Apply annotators
         for i, annotator in enumerate(self.annotators):
             logger.info("Applying annotator %d/%d...", i + 1, len(self.annotators))
             df = annotator.annotate_dataframe(df, self.text_column)
-        
+
         logger.info("Pipeline complete! Final: %d rows", len(df))
         return df
 
@@ -276,6 +392,7 @@ def process_corpus(
     max_words: Optional[int] = None,
     cefr_index: Optional[CEFRIndex] = None,
     max_rare_ratio: float = 0.3,
+    rare_levels: tuple = ("B2", "C1", "C2"),
     count_unknown_as_rare: bool = False,
     synonyms_map: Optional[Dict[str, str]] = None,
     synonyms_map_path: Optional[str] = None,
@@ -283,6 +400,17 @@ def process_corpus(
     dedup: Union[bool, str, None] = True,
     dedup_mode: Optional[str] = None,
     generate_stats: bool = True,
+    n_workers: int = 1,
+    paragraph_dedup: bool = False,
+    paragraph_min_chars: int = 50,
+    minhash_threshold: float = 0.8,
+    minhash_num_perm: int = 128,
+    strip_boilerplate: bool = False,
+    boilerplate_patterns: Optional[List[str]] = None,
+    repetition_filter: bool = False,
+    repetition_overrides: Optional[Dict[str, float]] = None,
+    language: Optional[str] = None,
+    language_min_prob: float = 0.8,
 ) -> Dict[str, Any]:
     """
     Process a parquet corpus through the pipeline.
@@ -301,6 +429,17 @@ def process_corpus(
         dedup: Backwards-compat. True → "exact", False → None.
         dedup_mode: "exact", "minhash", "both", None. Overrides dedup.
         generate_stats: Whether to generate statistics JSON
+        n_workers: Worker processes for per-doc operations (1 = serial)
+        paragraph_dedup: Remove paragraphs already seen in earlier docs
+        paragraph_min_chars: Min paragraph length eligible for removal
+        minhash_threshold: Jaccard threshold for MinHash near-dedup
+        minhash_num_perm: MinHash permutations
+        strip_boilerplate: Remove boilerplate lines before processing
+        boilerplate_patterns: Extra regex patterns added to the defaults
+        repetition_filter: Drop docs with degenerate repetition
+        repetition_overrides: Overrides for the repetition thresholds
+        language: Keep only docs in this language, e.g. "en" (needs langdetect)
+        language_min_prob: Minimum detection probability for the language gate
 
     Returns:
         Statistics dictionary if generate_stats=True, else empty dict
@@ -317,8 +456,15 @@ def process_corpus(
         normalize_mode=normalize_mode,
         dedup=dedup,
         dedup_mode=dedup_mode,
+        n_workers=n_workers,
+        paragraph_dedup=paragraph_dedup,
+        paragraph_min_chars=paragraph_min_chars,
+        minhash_threshold=minhash_threshold,
+        minhash_num_perm=minhash_num_perm,
+        strip_boilerplate=strip_boilerplate,
+        boilerplate_patterns=boilerplate_patterns,
     )
-    
+
     # Add filters
     if keywords:
         pipeline.add_keyword_filter(keywords)
@@ -336,21 +482,31 @@ def process_corpus(
         pipeline.add_vocabulary_filter(
             cefr_index,
             max_rare_ratio=max_rare_ratio,
+            rare_levels=rare_levels,
             count_unknown_as_rare=count_unknown_as_rare,
         )
+
+    if repetition_filter:
+        pipeline.add_repetition_filter(repetition_overrides)
+
+    if language:
+        pipeline.add_language_filter(language, min_prob=language_min_prob)
 
     # Add synonym mapping
     if synonyms_map or synonyms_map_path:
         pipeline.add_synonym_mapper(synonyms_map, synonyms_map_path)
-    
+
     # Add annotators
     if annotators:
         for annotator in annotators:
             pipeline.add_annotator(annotator)
     
     # Process
-    df_processed = pipeline.process(df)
-    
+    try:
+        df_processed = pipeline.process(df)
+    finally:
+        pipeline.close()
+
     # Write output
     logger.info("Writing output to: %s", output_path)
     if generate_stats:
@@ -378,18 +534,32 @@ def process_corpus_chunked(
     max_words: Optional[int] = None,
     cefr_index: Optional[CEFRIndex] = None,
     max_rare_ratio: float = 0.3,
+    rare_levels: tuple = ("B2", "C1", "C2"),
     count_unknown_as_rare: bool = False,
     synonyms_map: Optional[Dict[str, str]] = None,
     synonyms_map_path: Optional[str] = None,
     dedup: Union[bool, str, None] = True,
     dedup_mode: Optional[str] = None,
+    n_workers: int = 1,
+    paragraph_dedup: bool = False,
+    paragraph_min_chars: int = 50,
+    minhash_threshold: float = 0.8,
+    minhash_num_perm: int = 128,
+    strip_boilerplate: bool = False,
+    boilerplate_patterns: Optional[List[str]] = None,
+    repetition_filter: bool = False,
+    repetition_overrides: Optional[Dict[str, float]] = None,
+    language: Optional[str] = None,
+    language_min_prob: float = 0.8,
 ) -> Dict[str, Any]:
     """
     Process a parquet corpus in chunks for memory efficiency.
 
     Exact dedup uses a global hash set across chunks. MinHash dedup
-    (when dedup_mode is "minhash" or "both") runs as a post-pass on the
-    output file after chunked processing.
+    (when dedup_mode is "minhash" or "both") runs inline via a persistent
+    LSH index, so near-duplicates are caught across chunk boundaries without
+    re-reading the output. Paragraph dedup state likewise persists across
+    chunks inside the pipeline instance.
 
     Returns:
         Statistics dictionary for the final output.
@@ -412,8 +582,13 @@ def process_corpus_chunked(
         text_column=text_column,
         normalize=normalize,
         normalize_mode=normalize_mode,
-        dedup=False,      # we handle dedup ourselves
+        dedup=False,      # we handle dedup ourselves (needs cross-chunk state)
         dedup_mode=None,
+        n_workers=n_workers,
+        paragraph_dedup=paragraph_dedup,
+        paragraph_min_chars=paragraph_min_chars,
+        strip_boilerplate=strip_boilerplate,
+        boilerplate_patterns=boilerplate_patterns,
     )
 
     if keywords:
@@ -429,15 +604,25 @@ def process_corpus_chunked(
         pipeline.add_vocabulary_filter(
             cefr_index,
             max_rare_ratio=max_rare_ratio,
+            rare_levels=rare_levels,
             count_unknown_as_rare=count_unknown_as_rare,
         )
+    if repetition_filter:
+        pipeline.add_repetition_filter(repetition_overrides)
+    if language:
+        pipeline.add_language_filter(language, min_prob=language_min_prob)
     if synonyms_map or synonyms_map_path:
         pipeline.add_synonym_mapper(synonyms_map, synonyms_map_path)
 
-    # Global hash set for exact dedup across chunks
+    # Cross-chunk dedup state
     seen_hashes: set[int] = set()
     use_exact = effective_dedup in ("exact", "both")
     use_minhash = effective_dedup in ("minhash", "both")
+    minhash_deduper = (
+        MinHashDeduper(threshold=minhash_threshold, num_perm=minhash_num_perm)
+        if use_minhash
+        else None
+    )
 
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -456,6 +641,11 @@ def process_corpus_chunked(
             if use_exact and len(chunk_df) > 0:
                 chunk_df = exact_dedup(chunk_df, text_column, seen_hashes=seen_hashes)
 
+            if minhash_deduper is not None and len(chunk_df) > 0:
+                chunk_df = minhash_deduper.filter_chunk(
+                    chunk_df, text_column, mapper=pipeline.mapper()
+                )
+
             if len(chunk_df) == 0:
                 continue
 
@@ -467,21 +657,14 @@ def process_corpus_chunked(
     finally:
         if writer is not None:
             writer.close()
+        pipeline.close()
 
     logger.info("Chunked processing complete: %d chunks, %d rows written", chunk_num, total_rows)
 
-    # MinHash post-pass if requested
-    if use_minhash and total_rows > 0:
-        logger.info("Running MinHash post-pass on output...")
-        df_out = pl.read_parquet(str(out_path))
-        df_out = minhash_dedup(df_out, text_column)
-        df_out.write_parquet(str(out_path))
-        total_rows = len(df_out)
-
-    # Generate stats
+    # Generate stats without re-loading the corpus into memory
     if total_rows > 0:
-        df_final = pl.read_parquet(str(out_path))
-        stats = io_mod.write_parquet_with_stats(df_final, output_path, text_column)
+        stats = io_mod.generate_stats_streaming(str(out_path), text_column)
+        io_mod.write_stats(stats, str(out_path.with_suffix(".json")))
     else:
         stats = {"total_rows": 0}
 
