@@ -1,0 +1,79 @@
+# Pilot corpus config (PILOT_BRIEF.md) — authored for the 2026-08-19 pilot run
+# because the file referenced by the brief was absent from the repo.
+#
+# Sizing rationale (measured on this VM, see pilot report):
+#   - target token shares 55/15/30 web/wiki/schedules with a 28k BPE
+#   - measured tokens/word: fineweb 1.378, wiki(filtered) 1.458, schedules 3.632
+#   - schedules available: 17.43M words -> <=4 epochs caps schedules at ~69M words,
+#     which pins the corpus at ~850M raw tokens (train split ~845M >= 0.8B)
+#   - word targets: web 341M / wiki 88M / schedules 68.8M  (= weights below)
+#   - wiki (30M filtered words available) must upsample ~2.9 epochs to hold its
+#     15% share; fineweb has allow_upsample only as a safety valve (expect 1 epoch).
+
+seed: 42
+
+output:
+  dir: data/pilot_v1
+  shard_max_docs: 100000
+
+processing:
+  text_column: text
+  chunk_size: 50000             # fineweb_combined is 6GB; whole-file OOMs this 14GB VM
+  n_workers: 2                  # physical core count of this VM
+
+profiles:
+  prose:
+    normalize_mode: gentle
+    max_grade: 10.0
+    min_words: 20
+    max_words: 20000
+    cefr_csv: null
+    max_rare_ratio: 0.3
+    rare_levels: [B2, C1, C2]
+    count_unknown_as_rare: false
+    dedup_mode: exact
+    paragraph_dedup: true
+    paragraph_min_chars: 50
+    strip_boilerplate: true
+    repetition_filter: true
+    language: en
+    language_min_prob: 0.8
+
+  structured:                   # JSON/XML/key-value — pass through untouched
+    normalize_mode: none
+    max_grade: null
+    dedup_mode: exact
+
+sources:
+  # Listed order = dedup priority (earlier source keeps shared docs).
+  fineweb:
+    input: data/raw/fineweb_combined.parquet
+    profile: prose
+    weight: 0.685
+    allow_upsample: true        # safety valve only; gate-check epochs == 1
+  wiki:
+    input: data/raw/wikipedia.parquet
+    profile: prose
+    weight: 0.177
+    allow_upsample: true        # ~30M words available vs ~88M target -> ~3 epochs
+  schedules:
+    input: data/raw/schedules.parquet
+    profile: structured
+    weight: 0.138
+    allow_upsample: true        # ~3.9 epochs by construction (gate: <= 4)
+
+mix:
+  target_total_words: 497800000
+  cross_source_dedup: true
+
+tokenizer:
+  vocab_size: 28000
+  min_frequency: 2
+  eos_token: "<|endoftext|>"
+  pad_token: "<|pad|>"
+  extra_special_tokens: []
+  require_single_tokens: ["{", "}", "[", "]", ":", '"', ",", "-", "(", ")"]
+
+dataset:
+  seq_length: 1024
+  val_fraction: 0.005
